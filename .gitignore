@@ -1,0 +1,15 @@
+# colcon build output
+Software/workspace/build/
+Software/workspace/install/
+Software/workspace/log/
+
+# editor backups
+*.save
+*.save.*
+
+# local submission artifacts and rosbags
+Software/workspace/task_1b/
+Software/workspace/task_1c/
+Software/workspace/*.zip
+Software/workspace/*.png
+Software/workspace/HE_*_camera_detection.py

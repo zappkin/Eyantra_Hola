@@ -1,9 +1,10 @@
+#!/usr/bin/env python3
+##!/usr/bin/env python3
 # Copyright (c) 2026 e-Yantra, IIT Bombay. All rights reserved.
 # These simulation files and source code are the intellectual property of e-Yantra,
 # IIT Bombay, provided solely for eYRC 2026-27 (Theme: Hola The Explorer).
 # Sharing or redistribution of this material, in whole or in part, is not permitted.
 
-#!/usr/bin/env python3
 '''
 *****************************************************************************************
 *
@@ -16,16 +17,13 @@
 *****************************************************************************************
 '''
 
-# Team ID:          [ Team-ID ]
-# Author List:      [ Names of team members who worked on this file, separated by comma ]
+# Team ID:          3062
+# Author List:      Aruthra B
 # Filename:         camera_detection.py
 # Functions:        centre_of_quad(), find_trapezoids(), main()
-#                   [ Add every extra helper function you write to this list ]
 # Global variables: STREAM_URL, WINDOW, BINARY_WINDOW, FPS_WINDOW, ARENA_*, SAND_DISTANCE,
 #                   HOUGH_*, MIN_TRAPEZOID_AREA, PARALLEL_TOLERANCE_DEG, REPORT_PERIOD_SEC
-#                   [ Add every extra global variable you declare to this list ]
 # Service Clients:  pixel_to_world  ->  shape_interface/srv/PixelToWorld
-
 
 import math
 import time
@@ -37,243 +35,128 @@ import rclpy
 from rclpy.node import Node
 from shape_interface.srv import PixelToWorld
 
-###############################################################
-
-################# ADD EXTRA IMPORTS / GLOBALS HERE ############
-
-
-
-###############################################################
-
-
-############################ WHAT YOU HAVE TO DO ##############################
-#
-#  The overhead camera publishes an MJPEG stream of the arena. Three "station
-#  funnels" are painted on the arena floor -- each one is a TRAPEZOID (exactly
-#  ONE pair of parallel sides). Your job:
-#
-#   1. Detect the three trapezoids in every frame.
-#   2. Show a second window in which ONLY the trapezoid borders are white and
-#      everything else is black.
-#   3. Find each trapezoid's centre in pixels, and call the `pixel_to_world`
-#      ROS service to convert that pixel to arena coordinates in metres.
-#
-#  Other things on the floor WILL try to fool you: the arena wall, the central
-#  hexagon, circular markers and the rectangular "safe" that sits next to every
-#  funnel. Your filters have to reject all of them.
-#
-#  Run order:
-#      ros2 launch hb_description task1a.launch.py     # terminal 1 (simulation)
-#      ros2 run task_1a camera_feed                    # terminal 2 (this file)
-#
-#  The launch file already starts pixel_to_world_service for you. If you launch
-#  with enable_pixel_service:=false, start it yourself in its own terminal with
-#      ros2 run task_1a pixel_to_world_service
-#
-###############################################################################
-
-
 ##################### TUNABLE CONSTANTS #######################
-## These are STARTING values, not final answers. Keep the    ##
-## binary window open and tune them until only the three     ##
-## funnel borders survive.                                   ##
-###############################################################
-
 STREAM_URL = "http://127.0.0.1:8080/stream"
 WINDOW = "camera_feed"
 BINARY_WINDOW = "trapezoid_borders"
-FPS_WINDOW = 30                 # number of frames averaged for the FPS readout
+FPS_WINDOW = 30
 
-# Arena floor in image pixels, at the default 1280x720 stream. Everything
-# outside this rectangle is terrain -- the SAME sandy rock as the floor, so if
-# you do not crop it away it floods your mask. Re-measure these if you change
-# the camera or the stream resolution (open one frame in an image viewer and
-# read off the corners of the floor).
 ARENA_X0, ARENA_Y0, ARENA_X1, ARENA_Y1 = 304, 24, 975, 695
-
-# How far a pixel's colour must be from the floor's OWN colour before you call
-# it "a drawn feature". The floor texture is very uniform, so a modest
-# threshold separates cleanly. Raise it if noise leaks in, lower it if the pale
-# cyan funnel disappears.
 SAND_DISTANCE = 18
 
-# Line-detection parameters. The funnel borders are thin outlines only a few
-# pixels wide: a large enough minimum length keeps small icon detail out, and a
-# generous maximum gap bridges the break where a safe overlaps a border.
 HOUGH_THRESHOLD = 40
 HOUGH_MIN_LENGTH = 35
 HOUGH_MAX_GAP = 25
 
-MIN_TRAPEZOID_AREA = 1200       # px^2, throws away small enclosed blobs
-PARALLEL_TOLERANCE_DEG = 7      # two sides count as parallel within this angle
-
-# Converting and printing at the full frame rate would be unreadable and would
-# put ~90 service calls a second on the wire for no benefit.
+MIN_TRAPEZOID_AREA = 1200
+PARALLEL_TOLERANCE_DEG = 7
 REPORT_PERIOD_SEC = 0.5
-
 ###############################################################
 
 
-##############################################################
 def centre_of_quad(corners):
     """
-    Purpose:
-    ---
-    Find the centre of a quadrilateral given its four corners.
-
-    NOTE: the mean of the four corners is NOT the answer. A trapezoid's two
-    parallel sides have different lengths, so the corner mean is pulled towards
-    the shorter side and sits off the true centre of the shape. You want the
-    AREA centroid of the polygon instead -- look up image moments in OpenCV
-    (`cv2.moments` works on a contour, and the centroid is m10/m00, m01/m00).
-    Remember to handle the degenerate case where m00 is (nearly) zero.
-
-    Input Arguments:
-    ---
-    `corners` :  [ numpy array of shape (4, 2), dtype float ]
-        the four corners of the quadrilateral, in pixel coordinates
-
-    Returns:
-    ---
-    `cx` :  [ float ]  x coordinate of the centre, in pixels
-    `cy` :  [ float ]  y coordinate of the centre, in pixels
-
-    Example call:
-    ---
-    cx, cy = centre_of_quad(corners)
+    Find the centroid of a quadrilateral using image moments.
     """
-
-    cx, cy = 0.0, 0.0
-
-    ##############  ADD YOUR CODE HERE  ##############
-
-    ##################################################
-
+    pts = np.asarray(corners, dtype=np.float32).reshape((-1, 1, 2))
+    M = cv2.moments(pts)
+    if abs(M['m00']) > 1e-5:
+        cx = float(M['m10'] / M['m00'])
+        cy = float(M['m01'] / M['m00'])
+    else:
+        cx = float(np.mean(pts[:, 0, 0]))
+        cy = float(np.mean(pts[:, 0, 1]))
     return cx, cy
 
-
-##############################################################
 def find_trapezoids(frame):
-    """
-    Purpose:
-    ---
-    Locate the three station funnels (trapezoids) in one camera frame.
-
-    Suggested pipeline -- you write every step:
-
-      1. CROP to the arena rectangle (ARENA_X0 .. ARENA_Y1). Work on the crop
-         from here on and remember to add the offset back at the end.
-
-      2. BUILD A MASK of "everything that is not floor".
-         Do NOT use a plain HSV hue range: the three funnels are cyan, green
-         and orange, and the cyan one is so pale that any hue band wide enough
-         to catch it also catches the sand.
-         Instead: convert the crop to the LAB colour space, find the floor's
-         own colour (the MOST COMMON value in each of the three channels -- a
-         histogram/bincount gives you this), then measure how far every pixel
-         is from that colour. Pixels farther than SAND_DISTANCE are features.
-
-      3. CLEAN the mask with a small morphological closing so the thin borders
-         are not broken up.
-
-      4. DETECT EDGES (Canny) and then LINE SEGMENTS with the probabilistic
-         Hough transform, using HOUGH_THRESHOLD / HOUGH_MIN_LENGTH /
-         HOUGH_MAX_GAP. Keep the segments in a list -- you need them again.
-         Careful: the Hough call returns None when it finds nothing.
-
-      5. DRAW every detected segment onto a blank scratch image, thick enough
-         (about 3 px) that the four sides of one funnel join into a closed
-         loop, then close that image morphologically too.
-         This scratch image is throw-away geometry used only to FIND the
-         funnels -- it is not what you display.
-
-      6. FIND CONTOURS on the scratch image with the RETR_CCOMP retrieval
-         mode. A closed funnel shows up as a HOLE, i.e. an INNER contour, so
-         keep only contours that have a parent in the hierarchy, and drop the
-         ones smaller than MIN_TRAPEZOID_AREA.
-
-      7. APPROXIMATE each surviving contour to a polygon (`cv2.approxPolyDP`,
-         epsilon of roughly 3% of the arc length) and keep only the ones that
-         come out CONVEX and with exactly FOUR vertices. Circular markers
-         enclose nothing straight and the central hexagon has six sides, so
-         both drop out right here.
-
-      8. REJECT non-trapezoids. Measure the angle of each of the four sides,
-         then count how many of the two OPPOSITE-SIDE pairs are parallel
-         within PARALLEL_TOLERANCE_DEG. A trapezoid has exactly ONE such pair.
-         The rectangular safe next to every funnel has TWO -- this test is what
-         removes it. (Angles wrap: 179 deg and 1 deg are 2 deg apart, not 178.)
-
-      9. SHIFT the accepted corners back into full-frame coordinates by adding
-         (ARENA_X0, ARENA_Y0), and get the centre with centre_of_quad().
-
-     10. BUILD THE BINARY IMAGE that gets displayed: a black image the size of
-         the FULL frame with only the accepted trapezoid borders drawn white.
-         Do not just return the mask from step 2 -- the wall, the hexagon and
-         the safes all produce strong lines and none of them belong here.
-
-    OPTIONAL (for better accuracy, attempt it after the above works):
-    the corners from step 7 outline the region ENCLOSED by the detected
-    segments, so every side sits INSIDE the real border by roughly the width
-    the segments were drawn with. You can remove that bias by refitting a line
-    (`cv2.fitLine`) through the endpoints of the Hough segments that actually
-    belong to each side, then intersecting neighbouring sides to get the true
-    corner. Deciding which segments "belong" to a side is the interesting part:
-    a segment belongs if it runs nearly parallel to the side, lies within a few
-    pixels of it, and lies ALONGSIDE it rather than running past the corner.
-
-    Input Arguments:
-    ---
-    `frame` :  [ numpy array ]
-        one BGR frame straight from the camera stream
-
-    Returns:
-    ---
-    `binary` :  [ numpy array, uint8, same height/width as `frame` ]
-        trapezoid borders in white (255) on black (0), nothing else
-    `trapezoids` :  [ list of tuples ]
-        one (centre_x, centre_y, corners) per detected trapezoid, where
-        `corners` is a (4, 2) array in FULL-FRAME pixel coordinates
-
-    Example call:
-    ---
-    binary, trapezoids = find_trapezoids(frame)
-    """
-
-    binary = np.zeros(frame.shape[:2], np.uint8)
+    h, w = frame.shape[:2]
+    binary = np.zeros((h, w), dtype=np.uint8)
     trapezoids = []
 
-    ##############  ADD YOUR CODE HERE  ##############
+    # 1. Crop to arena region
+    x0, y0, x1, y1 = ARENA_X0, ARENA_Y0, ARENA_X1, ARENA_Y1
+    crop = frame[y0:y1, x0:x1]
+    if crop.size == 0:
+        return binary, trapezoids
 
-    ##################################################
+    # 2. LAB floor distance segmentation
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+    floor_color = np.array([
+        np.bincount(lab[:, :, 0].flatten()).argmax(),
+        np.bincount(lab[:, :, 1].flatten()).argmax(),
+        np.bincount(lab[:, :, 2].flatten()).argmax()
+    ], dtype=np.float32)
+
+    diff = np.linalg.norm(lab.astype(np.float32) - floor_color, axis=2)
+    mask = (diff > SAND_DISTANCE).astype(np.uint8) * 255
+
+    # 3. Detect line segments with Canny + HoughLinesP
+    edges = cv2.Canny(mask, 50, 150)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=HOUGH_THRESHOLD,
+                            minLineLength=HOUGH_MIN_LENGTH, maxLineGap=HOUGH_MAX_GAP)
+
+    scratch = np.zeros(crop.shape[:2], dtype=np.uint8)
+    if lines is not None:
+        for line in lines:
+            lx1, ly1, lx2, ly2 = line[0]
+            cv2.line(scratch, (lx1, ly1), (lx2, ly2), 255, 4)
+
+    # Bridge gaps so borders form closed loops
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    scratch = cv2.morphologyEx(scratch, cv2.MORPH_CLOSE, close_kernel)
+
+    # 4. Find enclosed regions
+    contours, hierarchy = cv2.findContours(scratch, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+
+    accepted_corners = []
+
+    if hierarchy is not None:
+        for idx, cnt in enumerate(contours):
+            area = cv2.contourArea(cnt)
+            if area < MIN_TRAPEZOID_AREA or area > 70000:
+                continue
+
+            epsilon = 0.035 * cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, epsilon, True)
+
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                pts = approx.reshape(4, 2)
+
+                angles = []
+                for i in range(4):
+                    p1 = pts[i]
+                    p2 = pts[(i + 1) % 4]
+                    ang = np.degrees(np.arctan2(p2[1] - p1[1], p2[0] - p1[0])) % 180.0
+                    angles.append(ang)
+
+                def is_parallel(a, b, tol=PARALLEL_TOLERANCE_DEG):
+                    d = abs(a - b)
+                    return d < tol or abs(d - 180.0) < tol
+
+                parallel_pairs = 0
+                if is_parallel(angles[0], angles[2]):
+                    parallel_pairs += 1
+                if is_parallel(angles[1], angles[3]):
+                    parallel_pairs += 1
+
+                # Exactly 1 pair of parallel sides = trapezoid
+                if parallel_pairs == 1:
+                    full_corners = pts.astype(np.float32) + np.array([x0, y0], dtype=np.float32)
+                    cx, cy = centre_of_quad(full_corners)
+                    trapezoids.append((cx, cy, full_corners))
+                    accepted_corners.append(np.round(full_corners).astype(np.int32))
+
+    # 5. Draw white outlines (thickness 2) on the binary mask
+    if accepted_corners:
+        cv2.drawContours(binary, accepted_corners, -1, 255, thickness=2)
+
+    if len(trapezoids) == 3:
+        cv2.imwrite("HE_3062_binary.png", binary)
 
     return binary, trapezoids
 
 
-##############################################################
 def main():
-    """
-    Purpose:
-    ---
-    Open the camera stream, run find_trapezoids() on every frame, display the
-    result, and periodically convert each trapezoid centre to world
-    coordinates through the `pixel_to_world` service.
-
-    Most of this function is written for you. Only the marked block is yours.
-
-    Input Arguments:
-    ---
-    None
-
-    Returns:
-    ---
-    None
-
-    Example call:
-    ---
-    Called automatically by the Python interpreter.
-    """
-
     rclpy.init()
     node = Node("camera_feed")
     client = node.create_client(PixelToWorld, "pixel_to_world")
@@ -302,7 +185,6 @@ def main():
         if not ok:
             break
 
-        # rolling frame rate over the last FPS_WINDOW frames
         stamps.append(time.monotonic())
         if len(stamps) >= 2:
             span = stamps[-1] - stamps[0]
@@ -310,7 +192,6 @@ def main():
 
         binary, trapezoids = find_trapezoids(frame)
 
-        # overlay: red outline + yellow centre dot for every detection
         for cx, cy, corners in trapezoids:
             cv2.polylines(frame, [np.round(corners).astype(np.int32)], True, (0, 0, 255), 2)
             cv2.circle(frame, (int(round(cx)), int(round(cy))), 6, (0, 255, 255), -1)
@@ -327,38 +208,21 @@ def main():
             last_report = now
             print(f"\n{len(trapezoids)} trapezoid(s):")
 
-            # sorted top-to-bottom, then left-to-right, so the printed order is
-            # stable from frame to frame
             for cx, cy, _ in sorted(trapezoids, key=lambda t: (t[1], t[0])):
+                req = PixelToWorld.Request()
+                req.pixel_x = float(cx)
+                req.pixel_y = float(cy)
 
-                ##############  ADD YOUR CODE HERE  ##############
-                #
-                # Convert this one pixel centre to world coordinates:
-                #
-                #   a. Build a PixelToWorld.Request() and fill in its
-                #      `pixel_x` and `pixel_y` fields (they are float64 --
-                #      cast, or the service call will reject them).
-                #   b. Send it with the ASYNCHRONOUS client call, then wait for
-                #      the answer with a spin-until-complete helper and a
-                #      timeout of about 1 second. Never use the blocking call
-                #      here -- it deadlocks when you are already spinning.
-                #   c. Read the result. Three cases to print, all of them:
-                #        - result is None                 -> the call timed out
-                #        - result.success is False        -> print .message
-                #        - otherwise                      -> print .world_x and
-                #                                            .world_y, in metres
-                #
-                # Suggested output format:
-                #   print(f"  pixel ({cx:7.2f}, {cy:7.2f})  ->  "
-                #         f"world ({wx:6.3f}, {wy:6.3f}) m")
-                #
-                # The service definition is in
-                #   src/shape_interface/srv/PixelToWorld.srv
-                # Read it -- it tells you the exact field names.
+                future = client.call_async(req)
+                rclpy.spin_until_future_complete(node, future, timeout_sec=1.0)
 
-                pass
-
-                ##################################################
+                result = future.result()
+                if result is None:
+                    print(f"  pixel ({cx:7.2f}, {cy:7.2f})  ->  timed out")
+                elif not result.success:
+                    print(f"  pixel ({cx:7.2f}, {cy:7.2f})  ->  failed: {result.message}")
+                else:
+                    print(f"  pixel ({cx:7.2f}, {cy:7.2f})  ->  world ({result.world_x:6.3f}, {result.world_y:6.3f}) m")
 
         if (cv2.waitKey(1) & 0xFF) == ord('q'):
             break
@@ -369,6 +233,5 @@ def main():
     rclpy.shutdown()
 
 
-##############################################################
 if __name__ == "__main__":
     main()

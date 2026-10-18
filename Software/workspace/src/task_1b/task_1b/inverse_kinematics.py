@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # Copyright (c) 2026 e-Yantra, IIT Bombay. All rights reserved.
 # These simulation files and source code are the intellectual property of e-Yantra,
 # IIT Bombay, provided solely for eYRC 2026-27 (Theme: Hola The Explorer).
@@ -88,7 +89,12 @@ def body_velocity_to_wheel_speeds(vx, vy, w):
     you have your inverse kinematics.
     """
     # ----- YOUR CODE HERE -----------------------------------------------
-    raise NotImplementedError("TODO: implement body_velocity_to_wheel_speeds")
+    r = WHEEL_RADIUS_M
+    d = CHASSIS_RADIUS_M
+    w_left  = ( np.cos(np.pi / 6) * vx + np.sin(np.pi / 6) * vy + d * w) / r
+    w_right = (-np.cos(np.pi / 6) * vx + np.sin(np.pi / 6) * vy + d * w) / r
+    w_back  = (-vy + d * w) / r
+    return [float(w_left), float(w_right), float(w_back)]
     # ----------------------------------------------------------------------
 
 
