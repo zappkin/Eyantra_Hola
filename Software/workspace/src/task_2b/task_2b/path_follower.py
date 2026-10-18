@@ -16,11 +16,11 @@
 *****************************************************************************************
 '''
 
-# Team ID:          [ Team-ID ]
-# Author List:      [ Names of team members who worked on this file, separated by comma ]
+# Team ID:          3062
+# Author List:      Dnyanad Patil, Aruthra B, Nukala Jitendra, Keshav Padia
 # Filename:         path_follower.py
-# Functions:        [ Add every extra helper function you write to this list ]
-# Global variables: [ Add every extra global variable you declare to this list ]
+# Functions:        None
+# Global variables: None
 
 
 ############################ WHAT YOU HAVE TO DO ##############################
@@ -66,8 +66,10 @@ LATCHED = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 # ----------------------------------------------------- robot (same as Task 1B)
 WHEEL_RADIUS_M = 0.0255       # m
 CHASSIS_RADIUS_M = 0.06412    # m, chassis centre to each wheel's axle
-WHEEL_ANGLES_RAD = np.radians([0.0, 0.0, 0.0])   # TODO: from Task 2A
-IK_MATRIX = np.zeros((3, 3))                     # TODO: from Task 2A
+WHEEL_ANGLES_RAD = np.radians([30.0, 150.0, 270.0])   # [left, right, back]
+# Row i: wheel i's drive direction (cos, sin) and lever arm, over the wheel radius.
+IK_MATRIX = np.array([[math.cos(a), math.sin(a), CHASSIS_RADIUS_M]
+                      for a in WHEEL_ANGLES_RAD]) / WHEEL_RADIUS_M
 _CTRL_LIMIT = 30.0            # rad/s, the wheels' ctrlrange in the robot's MJCF:
                               # faster commands are clamped by the simulation
 
@@ -79,23 +81,41 @@ _CTRL_LIMIT = 30.0            # rad/s, the wheels' ctrlrange in the robot's MJCF
 ##############  ADD YOUR CODE HERE  ##############
 
 def body_velocity_to_wheel_speeds(vx, vy, w):
-    pass   # TODO: from Task 2A
+    """Body twist (vx, vy, w) -> wheel speeds [left, right, back], rad/s."""
+    return IK_MATRIX @ np.array([vx, vy, w])
 
 
 def body_to_wheels(vx, vy, wz):
-    pass   # TODO: from Task 2A
+    """Like body_velocity_to_wheel_speeds(), but kept inside +/-_CTRL_LIMIT.
+    Returns a list."""
+    wheels = body_velocity_to_wheel_speeds(vx, vy, wz)
+    peak = np.max(np.abs(wheels))
+    if peak > _CTRL_LIMIT:
+        wheels = wheels * (_CTRL_LIMIT / peak)
+    return wheels.tolist()
 
 
 def yaw_from_quat(w, x, y, z):
-    pass   # TODO: from Task 2A
+    """Quaternion -> yaw, radians."""
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
 def wrap(a):
-    pass   # TODO: from Task 2A
+    """Angle -> the same angle in (-pi, pi]. 350 degrees becomes -10."""
+    a = math.fmod(a + math.pi, 2.0 * math.pi)
+    if a <= 0.0:
+        a += 2.0 * math.pi
+    return a - math.pi
 
 
 def to_body(vx_a, vy_a, yaw):
-    pass   # TODO: from Task 2A
+    """Arena-frame velocity -> body-frame velocity (vx, vy).
+    Check: at yaw = -pi/2 (facing up), arena (0, -v) must give body (v, 0)."""
+    # Plain rotation by -yaw. Measured in the sim: facing up, a body +vy
+    # (strafe left) moves the robot along arena +x, and a body +wz raises
+    # the odom yaw, so the two frames are not mirrored relative to each other.
+    c, s = math.cos(yaw), math.sin(yaw)
+    return vx_a * c + vy_a * s, -vx_a * s + vy_a * c
 
 
 class GoToPoint:
@@ -103,12 +123,50 @@ class GoToPoint:
     GoToPoint(v_max=0.30, tol=0.012, dt=1.0 / CONTROL_HZ), so make your TUNED
     gains the defaults -- zero gains do nothing."""
 
-    def __init__(self, v_max=0.0, w_max=0.0, kp=0.0, ki=0.0, kd=0.0,
-                 kyaw=0.0, kiyaw=0.0, kdyaw=0.0, tol=0.0, dt=0.0):
-        pass   # TODO: from Task 2A
+    # kp is stiffer than in 2A: here the target moves, and a robot trailing it
+    # by v / kp cuts every corner of the path by about that much.
+    def __init__(self, v_max=0.3, w_max=1.5, kp=5.0, ki=0.3, kd=0.1,
+                 kyaw=5.0, kiyaw=0.2, kdyaw=0.05, tol=0.003, dt=1.0 / CONTROL_HZ):
+        self.v_max, self.w_max = v_max, w_max            # m/s, rad/s caps
+        self.kp, self.ki, self.kd = kp, ki, kd           # position PID
+        self.kyaw, self.kiyaw, self.kdyaw = kyaw, kiyaw, kdyaw   # yaw PID
+        self.tol = tol                                   # m, stop inside this
+        self.dt = dt                                     # s, 1 / CONTROL_HZ
+        self.i_xy = np.zeros(2)          # integral of the (x, y) error, m*s
+        self.prev_xy = None              # last (x, y) error, for the D term
+        self.i_yaw = 0.0
+        self.prev_yaw = None
+        self.i_max = 0.05                # m*s, anti-windup clamp on i_xy
+        self.i_yaw_max = 0.2             # rad*s
 
     def step(self, pose, target, hold_yaw):
-        pass   # TODO: from Task 2A
+        """pose (x, y, yaw), target (x, y), hold_yaw -> (wheels, distance)."""
+        x, y, yaw = pose
+        err = np.array([target[0] - x, target[1] - y])
+        dist = float(np.hypot(err[0], err[1]))
+
+        if dist < self.tol:
+            v_a = np.zeros(2)
+            self.prev_xy = None
+        else:
+            self.i_xy = np.clip(self.i_xy + err * self.dt, -self.i_max, self.i_max)
+            d_xy = np.zeros(2) if self.prev_xy is None else (err - self.prev_xy) / self.dt
+            self.prev_xy = err
+            v_a = self.kp * err + self.ki * self.i_xy + self.kd * d_xy
+            speed = np.hypot(v_a[0], v_a[1])
+            if speed > self.v_max:
+                v_a *= self.v_max / speed
+
+        e_yaw = wrap(hold_yaw - yaw)
+        self.i_yaw = float(np.clip(self.i_yaw + e_yaw * self.dt,
+                                   -self.i_yaw_max, self.i_yaw_max))
+        d_yaw = 0.0 if self.prev_yaw is None else wrap(e_yaw - self.prev_yaw) / self.dt
+        self.prev_yaw = e_yaw
+        wz = self.kyaw * e_yaw + self.kiyaw * self.i_yaw + self.kdyaw * d_yaw
+        wz = max(-self.w_max, min(self.w_max, wz))
+
+        vx_b, vy_b = to_body(v_a[0], v_a[1], yaw)
+        return body_to_wheels(vx_b, vy_b, wz), dist
 
 ##################################################
 
@@ -119,7 +177,9 @@ def path_to_traj(msg):
     """nav_msgs/Path -> [(t, x, y), ...], t = pose stamp - path stamp, in s."""
     ##############  ADD YOUR CODE HERE  ##############
     # TODO: Time.from_msg(stamp) gives a Time; (Time - Time).nanoseconds * 1e-9
-    pass
+    t0 = Time.from_msg(msg.header.stamp)
+    return [((Time.from_msg(p.header.stamp) - t0).nanoseconds * 1e-9,
+             p.pose.position.x, p.pose.position.y) for p in msg.poses]
     ##################################################
 
 

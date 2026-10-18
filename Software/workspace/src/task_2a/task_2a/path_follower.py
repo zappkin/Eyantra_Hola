@@ -17,7 +17,7 @@
 '''
 
 # Team ID:          3062
-# Author List:      [ Names of team members who worked on this file, separated by comma ]
+# Author List:      Dnyanad Patil, Aruthra B, Nukala Jitendra, Keshav Padia
 # Filename:         path_follower.py
 # Functions:        None
 # Global variables: None

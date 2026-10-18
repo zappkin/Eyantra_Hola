@@ -16,11 +16,11 @@
 *****************************************************************************************
 '''
 
-# Team ID:          [ Team-ID ]
-# Author List:      [ Names of team members who worked on this file, separated by comma ]
+# Team ID:          3062
+# Author List:      Dnyanad Patil, Aruthra B, Nukala Jitendra, Keshav Padia
 # Filename:         path_planner.py
-# Functions:        [ Add every extra helper function you write to this list ]
-# Global variables: [ Add every extra global variable you declare to this list ]
+# Functions:        astar(), line_clear(), shortcut()
+# Global variables: GOAL_DECEL, RAMP_STEPS
 
 
 ############################ WHAT YOU HAVE TO DO ##############################
@@ -59,6 +59,10 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
 
 ################# ADD EXTRA IMPORTS / GLOBALS HERE ############
+import heapq
+
+GOAL_DECEL = 0.15                    # m/s^2, how hard the path slows into a goal
+RAMP_STEPS = 10                      # poses in each slow-down ramp
 
 ###############################################################
 
@@ -84,7 +88,7 @@ SAND_LOW, SAND_HIGH = (10, 40, 170), (30, 120, 255)      # sand colour, HSV
 PLAN_CELL = 0.04                     # m, planning grid cell
 PLAN_SPEED = 0.24                    # m/s, the speed the path is timed at
 GOAL_STOP = 2.0                      # s, stop this long on each goal
-START_DELAY = 2.0                    # s, from publishing to setting off
+START_DELAY = 5.0                    # s, from publishing to setting off
 
 LATCHED = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 
@@ -139,6 +143,41 @@ def remove_drivable(frame, occupied, robots, goals):
     #     (the pillars are grey, so colour separates them)
     #   - start circles, robots, goal dots: clear_circle(), with room round
     #     each goal for the whole robot
+    # Real obstacles (pillars, machines, the payloads' dark rims) are grey or
+    # dark; the paint, the pads' rings and the goal dots are saturated colour.
+    hsv = cv2.cvtColor(cv2.medianBlur(crop_arena(frame), 5), cv2.COLOR_BGR2HSV)
+    sand = cv2.inRange(hsv, SAND_LOW, SAND_HIGH) > 0
+    # the vault's light beam and its crystals are pale or bright green, which
+    # the grey test would catch; the pillars are colourless and the cyan
+    # payload's hue is above 85, so neither is caught here
+    beam = (hsv[..., 0] >= 30) & (hsv[..., 0] <= 80) & (hsv[..., 1] >= 20) & (hsv[..., 2] >= 100)
+    grey = (((hsv[..., 1] < 60) | (hsv[..., 2] < 60)) & ~sand & ~beam).astype(np.uint8) * 255
+
+    # seal the payloads' rims and fill them in; the hexagon's dashed border
+    # closes into a much bigger loop, so only fill payload-sized shapes.
+    # Painted dashes and specks are dropped by area.
+    grey = cv2.morphologyEx(grey, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    contours, _ = cv2.findContours(grey, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    solid = np.zeros_like(grey)
+    for c in contours:
+        _, _, w, h = cv2.boundingRect(c)
+        if cv2.contourArea(c) > 300 and max(w, h) < 100:
+            cv2.drawContours(solid, [c], -1, 255, cv2.FILLED)
+    big = np.zeros_like(grey)
+    cv2.drawContours(big, [c for c in contours if max(cv2.boundingRect(c)[2:]) >= 100], -1, 255, cv2.FILLED)
+    solid |= grey & big                                    # big loops: the grey pixels only
+    solid = cv2.morphologyEx(solid, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
+    solid = cv2.dilate(solid, np.ones((7, 7), np.uint8))   # cover soft edges and shadows
+
+    keep = cv2.resize(solid, (GRID_CELLS, GRID_CELLS), interpolation=cv2.INTER_AREA) > 0
+    occupied = occupied & keep
+
+    for c in START_CIRCLES:
+        clear_circle(occupied, c, 0.12)
+    for r in robots:
+        clear_circle(occupied, r, ROBOT_RADIUS + 0.02)
+    for g in goals:   # + a planning cell, so the goal's cell survives planning_grid()
+        clear_circle(occupied, g, ROBOT_RADIUS + SAFETY_MARGIN + PLAN_CELL)
     return occupied
     ##################################################
 
@@ -198,8 +237,87 @@ def plan_route(blocked, start):
     #   2. straighten the zig-zags where the straight line is clear
     #   3. t = distance so far / PLAN_SPEED; on each goal add its point again
     #      at t + GOAL_STOP; end exactly on each goal
-    pass
+    points = [tuple(start)]
+    for goal in GOALS:
+        a, b = nearest_free(blocked, points[-1]), nearest_free(blocked, goal)
+        if a is None or b is None:
+            return None
+        cells = astar(blocked, a, b)
+        if cells is None:
+            return None
+        points += shortcut(blocked, [to_world(c) for c in cells])[1:-1] + [goal]
+
+    # Time it at PLAN_SPEED, but ease into each goal: the follower cuts the
+    # wheels the moment the robot is on the goal, and at full speed the sudden
+    # stop rocks it a couple of cm back off the goal.
+    route, t = [(0.0, *points[0])], 0.0
+    for p, q in zip(points, points[1:]):
+        seg = math.dist(p, q)
+        if q not in GOALS:
+            t += seg / PLAN_SPEED
+            route.append((t, *q))
+            continue
+        ramp = min(seg, PLAN_SPEED ** 2 / (2 * GOAL_DECEL))
+        if seg > ramp:                               # cruise up to the ramp
+            u = (seg - ramp) / seg
+            t += (seg - ramp) / PLAN_SPEED
+            route.append((t, p[0] + (q[0] - p[0]) * u, p[1] + (q[1] - p[1]) * u))
+        for k in range(1, RAMP_STEPS + 1):           # v = sqrt(2 a s) down to a crawl
+            s_mid = ramp * (RAMP_STEPS - k + 0.5) / RAMP_STEPS
+            v = max(math.sqrt(2 * GOAL_DECEL * s_mid), 0.02)
+            t += ramp / RAMP_STEPS / v
+            u = 1.0 - ramp * (RAMP_STEPS - k) / RAMP_STEPS / seg
+            route.append((t, p[0] + (q[0] - p[0]) * u, p[1] + (q[1] - p[1]) * u))
+        route[-1] = (t, *q)                          # end exactly on the goal
+        t += GOAL_STOP
+        route.append((t, *q))
+    return route
     ##################################################
+
+
+def astar(blocked, a, b):
+    """A* over free cells, 8-connected, from cell a to cell b. Cells, or None."""
+    n_i, n_j = blocked.shape
+    steps = [(di, dj, math.hypot(di, dj)) for di in (-1, 0, 1) for dj in (-1, 0, 1) if di or dj]
+    came, cost, todo = {a: None}, {a: 0.0}, [(math.dist(a, b), a)]
+    while todo:
+        _, c = heapq.heappop(todo)
+        if c == b:
+            path = []
+            while c is not None:
+                path.append(c)
+                c = came[c]
+            return path[::-1]
+        for di, dj, d in steps:
+            nb = (c[0] + di, c[1] + dj)
+            if not (0 <= nb[0] < n_i and 0 <= nb[1] < n_j) or blocked[nb]:
+                continue
+            if di and dj and (blocked[c[0] + di, c[1]] or blocked[c[0], c[1] + dj]):
+                continue                                # no cutting corners
+            g = cost[c] + d
+            if g < cost.get(nb, math.inf):
+                cost[nb], came[nb] = g, c
+                heapq.heappush(todo, (g + math.dist(nb, b), nb))
+    return None
+
+
+def line_clear(blocked, p, q):
+    """True if the straight line p -> q (in m) crosses no blocked cell."""
+    n = max(1, int(math.dist(p, q) / (PLAN_CELL / 4)))
+    return not any(blocked[to_cell((p[0] + (q[0] - p[0]) * k / n, p[1] + (q[1] - p[1]) * k / n))]
+                   for k in range(n + 1))
+
+
+def shortcut(blocked, pts):
+    """Drop the zig-zags: from each point, jump to the farthest one in sight."""
+    out, i = [pts[0]], 0
+    while i < len(pts) - 1:
+        j = len(pts) - 1
+        while j > i + 1 and not line_clear(blocked, pts[i], pts[j]):
+            j -= 1
+        out.append(pts[j])
+        i = j
+    return out
 
 
 ######################### NODE ################################
@@ -229,7 +347,17 @@ class PathPlanner(Node):
         ##############  ADD YOUR CODE HERE  ##############
         # TODO: frame_id "odom" on the path and each PoseStamped; path stamp =
         # start, each pose's stamp = start + Duration(seconds=t) (.to_msg()).
-        pass
+        msg = Path()
+        msg.header.frame_id = "odom"
+        msg.header.stamp = start.to_msg()
+        for t, x, y in plan:
+            pose = PoseStamped()
+            pose.header.frame_id = "odom"
+            pose.header.stamp = (start + Duration(seconds=t)).to_msg()
+            pose.pose.position.x, pose.pose.position.y = float(x), float(y)
+            pose.pose.orientation.w = 1.0
+            msg.poses.append(pose)
+        return msg
         ##################################################
 
     def tick(self):

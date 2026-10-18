@@ -13,3 +13,8 @@ Software/workspace/task_1c/
 Software/workspace/*.zip
 Software/workspace/*.png
 Software/workspace/HE_*_camera_detection.py
+
+# rosbags and submission staging, per task
+Software/workspace/task_*/
+Software/workspace/submission_*/
+__pycache__/
